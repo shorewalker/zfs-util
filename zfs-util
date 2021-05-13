@@ -1,0 +1,244 @@
+#!/bin/bash
+sshkeytype="rsa"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+ORANGE='\033[0;33m'
+NC='\033[0m'
+
+#echo "zfs-util $@" 1>&2
+
+usage() {
+        echo "${0/*\/} upgrade"
+        echo "${0/*\/} snapshot <filesystem>"
+        echo "${0/*\/} rollback <filesystem>"
+        echo "${0/*\/} get-latest <filesystem>"
+        echo "${0/*\/} get-latest-remote <filesystem> <remotesystem> [--listkey <listkey>]"
+        echo "${0/*\/} get-earliest <filesystem>"
+        echo "${0/*\/} get-children <filesystem>"
+        echo "${0/*\/} backup <filesystem> <remotesystem> [--listkey <listkey>] [--sendkey <sendkey>] [--opts <opts>] [--init]"
+        echo "${0/*\/} backup-children <filesystem> <remotesystem> [--listkey <listkey>] [--sendkey <sendkey>] [--opts <opts>] [--init]"
+        echo "${0/*\/} remove-older-than [-r] <filesystem> <date>"
+                echo "${0/*\/} snapshot-status <zvol> <unixtimesnap>"
+}
+
+if [ $# -eq 0 ]; then
+        usage 1>&2 ;
+        exit 1;
+fi
+
+case $1 in
+        upgrade )
+                find /lib/modules/$(uname -r)/extra -name "splat.ko" -or -name "zcommon.ko" -or -name "zpios.ko" -or -name "spl.ko" -or -name "zavl.ko" -or -name "zfs.ko" -or -name "znvpair.ko" -or -name "zunicode.ko" | xargs rm -f
+                find /lib/modules/$(uname -r)/weak-updates -name "splat.ko" -or -name "zcommon.ko" -or -name "zpios.ko" -or -name "spl.ko" -or -name "zavl.ko" -or -name "zfs.ko" -or -name "znvpair.ko" -or -name "zunicode.ko" | xargs rm -f
+                yum reinstall zfs-release
+                yum reinstall $(rpm -qa | egrep "zfs|spl")
+                exit;;
+        snapshot )
+                filesystem=$2
+                zfs snapshot $filesystem@$(date +\%F.\%T)
+                exit;;
+        get-latest )
+                filesystem=$2
+                snapshot_latest_local=$( zfs list -H -o name -t snapshot -r $filesystem -d 1 -s creation | grep "^$filesystem@" | tail -n 1 )
+                echo $snapshot_latest_local
+                exit;;
+        get-latest-remote )
+                filesystem=$2
+                sshtarget=$3
+                if [[ $4 = "--listkey" ]] ; then
+                        sshkey_list=$5
+                fi
+                sshkey_list_default=~/.ssh/zfs-list-${filesystem//\//-}_$sshkeytype
+                if [ -z $sshkey_list ] ; then
+                        sshkey_list=$sshkey_list_default
+                fi
+                if [ ! -f $sshkey_list ] ; then
+                        echo "$sshkey_list doesn't exist." 1>&2
+                        exit 1
+                fi
+                snapshot_latest_remote=$( ssh -T -o PreferredAuthentications=publickey -i $sshkey_list $sshtarget $filesystem | grep -Eo @.+ )
+                returnvalue=$?
+                echo $snapshot_latest_remote
+                exit $returnvalue;;
+        backup | backup-children )
+                if [ $# -lt 4 ] ; then
+                        echo "$0 <zfs filesystem> <ssh target> [--listkey <ssh idenity file>] [--sendkey <ssh identity file>] [--opts <opts>] [--init]"
+                        exit 1
+                fi
+                filesystem_source=$2
+                filesystem_destination=$3
+                sshtarget=$4
+                #echo $filesystem_source $sshtarget $filesystem_destination $sshtarget
+                init=false
+                children=false
+                if [[ $1 = "backup-children" ]] ; then
+                        children=true
+                fi
+                while [ $# -gt "4" ] ; do
+                        case $5 in
+                                --listkey )
+                                        sshkey_list=$6
+                                        shift;shift;;
+                                --sendkey )
+                                        sshkey_send=$6
+                                        shift;shift;;
+                                --init )
+                                        init=true
+                                        shift;;
+                                -o | --opts )
+                                        opts=$6
+                                        shift;shift;;
+                                * )
+                                        echo "Unknown option $5"
+                                        echo $USAGE
+                                        exit 1
+                        esac
+                done
+
+                sshkey_list_default=~/.ssh/zfs-list-${filesystem_source//\//-}_$sshkeytype
+                if [ -z $sshkey_list ] ; then
+                        sshkey_list=$sshkey_list_default
+                fi
+                if [ ! -f $sshkey_list ] ; then
+                        echo "$sshkey_list doesn't exist." 1>&2
+                        exit 1
+                fi
+
+                sshkey_send_default=~/.ssh/zfs-send-${filesystem_source//\//-}_$sshkeytype
+                if [ -z $sshkey_send ] ; then
+                        sshkey_send=$sshkey_send_default
+                fi
+                if [ ! -f $sshkey_send ] ; then
+                        echo "$sshkey_send doesn't exist." 1>&2
+                        exit 1
+                fi
+
+                if $children && $init ; then
+                        for child_filesystem in $( $0 get-children $filesystem_source ) ; do
+                                if [ ! -z $( $0 get-latest $child_filesystem ) ]; then
+                                        $0 backup $child_filesystem $filesystem_destination${child_filesystem/$filesystem_source/} $sshtarget --init ${opts:+--opts $opts} --listkey $sshkey_list --sendkey $sshkey_send
+                                fi
+                        done
+                        exit
+                fi
+
+                if $children ; then
+                        for child_filesystem in $( $0 get-children $filesystem_source ) ; do
+                                if [ ! -z $( $0 get-latest $child_filesystem ) ]; then
+                                        $0 backup $child_filesystem $filesystem_destination${child_filesystem/$filesystem_source/} $sshtarget --listkey $sshkey_list --sendkey $sshkey_send
+                                fi
+                        done
+                        exit
+                fi
+
+                if $init ; then
+                        snapshot_earliest_local=$( $0 get-earliest $filesystem_source )
+                        zfs send ${opts:+-$opts} $snapshot_earliest_local | ssh -T -o PreferredAuthentications=publickey -i $sshkey_send $sshtarget
+                        exit
+                fi
+
+                snapshot_latest_local=$( $0 get-latest $filesystem_source )
+
+                if [ -z $snapshot_latest_local ] ; then
+                        #echo local $filesystem_source has no snapshots.
+                        exit
+                fi
+
+                snapshot_latest_remote=$( $0 get-latest-remote $filesystem_destination $sshtarget --listkey $sshkey_list )
+                if [ -z $snapshot_latest_remote ] ; then
+                        #echo $sshtarget $filesystem_destination has no snapshots.
+                        exit
+                fi
+
+                if [ $snapshot_latest_remote == ${snapshot_latest_local/$filesystem_source/} ] ; then
+                        #echo $sshtarget $filesystem_destination$snapshot_latest_remote equivalent to $snapshot_latest_local
+                        exit
+                fi
+                zfs send ${opts:+-$opts} -I $snapshot_latest_remote $snapshot_latest_local | ssh -T -o PreferredAuthentications=publickey -i $sshkey_send $sshtarget
+
+                exit;;
+        get-earliest )
+                filesystem=$2
+                snapshot_latest_local=$( zfs list -H -o name -t snapshot -r $filesystem -d 1 -s creation | grep "^$filesystem@" | head -n 1 )
+                echo $snapshot_latest_local
+                exit;;
+        get-children )
+                filesystem=$2
+                zfs list -H -r -o name $filesystem | tail -n +2
+                exit;;
+        get-clones )
+                zroot=$2
+                zfs get -r -H -t snapshot clones $zroot | sed -r '/^([^[:space:]]+)\s+clones\s+-/d;s/,|clones\t|\t-/\n\t/g'
+                exit;;
+        rollback )
+                filesystem=$2
+                zfs rollback $($0 get-latest $filesystem)
+                exit;;
+        remove-older-than )
+                recursive=false
+                if [ $2 == "-r" ]; then
+                        recursive=true
+                        shift;
+                fi
+                filesystem=$2
+                if [ -n "$3" ] ; then
+                        earliest_creation=$( date --date="$3" +%s )
+                fi
+                if [ -z "$earliest_creation" ] ; then
+                        echo "Bad time: unknown format - $3" 1>&2
+                        exit 1
+                elif [ $earliest_creation -gt $( date --date="now" +%s ) ] ; then
+                        echo "Bad time: Time in future - $(date --date="@$earliest_creation"). Try including \"ago\"?" 1>&2
+                        exit 1
+                fi
+                if $recursive; then
+                        for zvol in $(zfs list -o name -H -r $filesystem); do
+                                $0 remove-older-than $zvol "@$earliest_creation"
+                        done
+                        exit
+                fi
+                earliest_snapshot=$( $0 get-earliest $filesystem )
+                if [ $earliest_creation -le $( date --date="$( zfs list -H $earliest_snapshot -o creation )" +%s ) ] ; then
+                        exit
+                fi
+                bufferIFS=$IFS
+                IFS=$'\n'
+                for line in $( zfs list -H -r -d 1 $filesystem -t snapshot -o name,creation -s creation ); do
+                        if [ $( date --date=$(echo $line | cut -f 2) +%s ) -lt $earliest_creation ] ; then
+                                terminus=$(echo $line | sed -r "s/^.+@(.+)\t.+/\1/" )
+                        else
+                                break
+                        fi
+                done
+                zfs destroy -d "$($0 get-earliest $filesystem)%$terminus"
+                IFS=$bufferIFS
+                exit;;
+        snapshot-status )
+                zroot=$2
+                stale=$3
+                if [ "$4" == "-v" ]; then
+                        verbose=true
+                fi
+                now=$(date +%s)
+
+                for zdataset in $(zfs list -H -o name -r $zroot); do
+                        zsnap=$(zfs-util get-latest $zdataset);
+                        if [ ! -z $zsnap ]; then
+                                zsnaptimestamp=$(zfs list -Hp -o creation $zsnap);
+                                if [ $(( $now - $stale )) -lt $zsnaptimestamp ]; then
+                                        [ $verbose ] && echo -e $GREEN$zdataset$NC;
+                                else
+                                        echo -e $ORANGE$zdataset        $(date --date=@$zsnaptimestamp)$NC
+                                fi
+                        else
+                                echo -e $RED$zdataset NOSNAP$NC;
+                        fi
+                done
+
+                exit;;
+        * )
+                echo "Unknown option $1"
+                usage 1>&2 ;
+                exit 1;;
+esac
